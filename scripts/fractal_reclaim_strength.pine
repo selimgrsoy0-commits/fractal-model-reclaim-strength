@@ -14,10 +14,10 @@ show_lines       = input.bool(true, "Level Lines (C1 & C2 Extreme)", group=grp_v
 show_line_labels = input.bool(true, "Price Labels", group=grp_visual, tooltip="Shows the level price at the right end of the line.")
 
 // --- 2. STATS TABLE ---
-show_tbl    = input.bool(true, "Show Table", inline="tbl_view", group=grp_table, tooltip="Shows live setup status and historical hit rates.")
+show_tbl    = input.bool(true, "Show Table", inline="tbl_view", group=grp_table, tooltip="Shows the latest setup and historical C2-extreme survival rates, not trade win rates. All completed setups enter the sample, including overlapping ones.")
 tbl_pos     = input.string("Top Right", "Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], inline="tbl_view", group=grp_table)
 tbl_size_in = input.string("Compact", "Size", options=["Compact", "Tiny", "Normal"], inline="tbl_view", group=grp_table)
-bars_mode   = input.string("All Available Bars", "Sample", options=["All Available Bars", "Last 5000 Bars", "Last 1000 Bars", "Last 500 Bars"], group=grp_table, tooltip="How many past bars feed the table statistics. Windowed modes re-filter on every bar close, so old setups drop out as new ones arrive.")
+bars_mode   = input.string("All Available Bars", "Sample", options=["All Available Bars", "Last 5000 Bars", "Last 1000 Bars", "Last 500 Bars"], group=grp_table, tooltip="Uses this chart's bars and feed, not the offline research sample. Last N Bars selects C2 among the latest N closed chart bars; only setups whose C4 has closed are counted. Updates on bar close. Session gaps and incomplete minute coverage are not filtered.")
 
 // ==========================================
 // 2. HELPERS & FUNCTIONS
@@ -56,36 +56,41 @@ format_pct(float val) =>
     na(val) ? "–" : str.tostring(val, "0.0") + "%"
 
 format_delta(float val) =>
-    na(val) ? "–" : (val > 0.0 ? "+" : "") + str.tostring(val, "0.0") + "%"
+    na(val) ? "–" : (val > 0.0 ? "+" : "") + str.tostring(val, "0.0") + " pp"
 
 // ==========================================
-// 3. EVENT STORE + COUNTERS (6 BINS + BASE)
-// Every closed setup is stored once (C2 bar + packed outcome).
-// Counters rebuild from the store on each confirmed bar, so
-// windowed samples ("Last 500") stay exact as bars stream in:
-// old setups drop out, new ones come in. Matches the reference
-// matrix bins: [10,25,50,75,100], side='right'.
+// 3. INCREMENTAL COUNTERS (6 BINS + BASE)
+// All-history mode stores only counters. Windowed modes use a
+// fixed-size ring keyed by C2 bar: at most one setup per bar.
+// Each close removes at most one expired event and adds at most
+// one matured event. O(1) work per bar, O(window) bounded storage.
+// RS bins match [10,25,50,75,100], side='right'.
 // code packing: bin | reaches?8 | full?16 | xc2?32
 // ==========================================
-var int[] ev_bar  = array.new_int()
-var int[] ev_code = array.new_int()
-
 var int[] bin_n       = array.new_int(6, 0)
 var int[] bin_reaches = array.new_int(6, 0)
 var int[] bin_full    = array.new_int(6, 0)
 var int[] bin_xc2     = array.new_int(6, 0)
 
-var int total_n       = 0
-var int total_reaches = 0
-var int total_full    = 0
-var int total_xc2     = 0
-
-// Sample window (scoped on the setup's own C2 bar)
+// Window ends at the latest confirmed bar, including that bar.
+// C2 offsets 0..N-1 are eligible; offsets 0 and 1 are not mature.
 int max_lookback = switch bars_mode
     "Last 5000 Bars" => 5000
     "Last 1000 Bars" => 1000
     "Last 500 Bars"  => 500
-    => 1000000
+    => 0
+bool is_windowed = max_lookback > 0
+var int[] window_codes = array.new_int(max_lookback, -1)
+
+adjust_counts(int code, int change) =>
+    int b = code % 8
+    array.set(bin_n, b, array.get(bin_n, b) + change)
+    if math.floor(code / 8) % 2 == 1
+        array.set(bin_reaches, b, array.get(bin_reaches, b) + change)
+    if math.floor(code / 16) % 2 == 1
+        array.set(bin_full, b, array.get(bin_full, b) + change)
+    if math.floor(code / 32) % 2 == 1
+        array.set(bin_xc2, b, array.get(bin_xc2, b) + change)
 
 // ==========================================
 // 4. HISTORICAL EVENT MEASUREMENT ENGINE
@@ -95,6 +100,14 @@ int max_lookback = switch bars_mode
 // Breach is strict < / >; equality holds (not a live stop rule).
 // ==========================================
 if bar_index >= 3 and barstate.isconfirmed and not is_too_low
+    // Expire C2 at bar_index-N, even when this bar adds no setup.
+    if is_windowed
+        int expired_slot = bar_index % max_lookback
+        int expired_code = array.get(window_codes, expired_slot)
+        if expired_code >= 0
+            adjust_counts(expired_code, -1)
+        array.set(window_codes, expired_slot, -1)
+
     float c1_h = high[3]
     float c1_l = low[3]
     float c1_rng = c1_h - c1_l
@@ -124,40 +137,14 @@ if bar_index >= 3 and barstate.isconfirmed and not is_too_low
 
             int b = get_bin(rs_2)
             int code = b + (reaches ? 8 : 0) + (full ? 16 : 0) + (xc2 ? 32 : 0)
-            array.push(ev_bar, bar_index - 2)
-            array.push(ev_code, code)
+            adjust_counts(code, 1)
+            if is_windowed
+                array.set(window_codes, (bar_index - 2) % max_lookback, code)
 
-    // Rebuild counters from the store (confirmed bars only, so
-    // realtime ticks never pay the loop; history loads append
-    // first and recount once per close — O(n), not O(n²)).
-    array.fill(bin_n, 0)
-    array.fill(bin_reaches, 0)
-    array.fill(bin_full, 0)
-    array.fill(bin_xc2, 0)
-    total_n       := 0
-    total_reaches := 0
-    total_full    := 0
-    total_xc2     := 0
-    int ev_total = array.size(ev_bar)
-    if ev_total > 0
-        for i = 0 to ev_total - 1
-            if (last_bar_index - array.get(ev_bar, i)) <= max_lookback
-                int code_i = array.get(ev_code, i)
-                int b_i = code_i % 8
-                bool r_i = math.floor(code_i / 8) % 2 == 1
-                bool f_i = math.floor(code_i / 16) % 2 == 1
-                bool x_i = math.floor(code_i / 32) % 2 == 1
-                array.set(bin_n, b_i, array.get(bin_n, b_i) + 1)
-                total_n += 1
-                if r_i
-                    array.set(bin_reaches, b_i, array.get(bin_reaches, b_i) + 1)
-                    total_reaches += 1
-                if f_i
-                    array.set(bin_full, b_i, array.get(bin_full, b_i) + 1)
-                    total_full += 1
-                if x_i
-                    array.set(bin_xc2, b_i, array.get(bin_xc2, b_i) + 1)
-                    total_xc2 += 1
+int total_n       = array.sum(bin_n)
+int total_reaches = array.sum(bin_reaches)
+int total_full    = array.sum(bin_full)
+int total_xc2     = array.sum(bin_xc2)
 
 // ==========================================
 // 5. ACTIVE C2 SETUP TRACKING
@@ -191,9 +178,22 @@ var float  active_extreme    = na
 var bool   active_failed     = false
 var int    active_failed_bar = na
 var int    active_bin        = -1
+var string previous_setup    = ""
+
+// Resolve the tracked setup BEFORE a new C2 can replace it.
+// Intrabar lows/highs retain a breach for the rest of that bar.
+if not na(active_c2_bar) and bar_index > active_c2_bar and bar_index <= active_c2_bar + 2 and not is_too_low
+    bool is_fail_now = (active_dir == "Bull" and low < active_c2_l) or (active_dir == "Bear" and high > active_c2_h)
+    if is_fail_now and not active_failed
+        active_failed     := true
+        active_failed_bar := bar_index
 
 // Active setup updates when C2 closes
 if barstate.isconfirmed and is_setup_now and not is_too_low
+    if not na(active_c2_bar)
+        string previous_outcome = active_failed ? "Invalidated " + (active_failed_bar - active_c2_bar == 1 ? "C3" : "C4") :
+             bar_index >= active_c2_bar + 2 ? "Full C4 held" : "Replaced in C3 (unfinished)"
+        previous_setup := "Previous: " + active_dir + " · " + previous_outcome
     active_dir        := is_bull_now ? "Bull" : "Bear"
     active_c2_bar     := bar_index
     active_c2_h       := c2_h_now
@@ -206,17 +206,8 @@ if barstate.isconfirmed and is_setup_now and not is_too_low
     active_extreme    := is_bull_now ? c2_l_now : c2_h_now
     active_bin        := get_bin(active_rs)
 
-// C2 extreme breach check while the setup is live (C3 and C4).
-// Note: the stats engine above is isconfirmed-gated; this block
-// is the live status board and updates intrabar.
-if not na(active_c2_bar) and bar_index > active_c2_bar and bar_index <= active_c2_bar + 2 and not is_too_low
-    bool is_fail_now = (active_dir == "Bull" and low < active_c2_l) or (active_dir == "Bear" and high > active_c2_h)
-    if is_fail_now and not active_failed
-        active_failed     := true
-        active_failed_bar := bar_index
-
 // Setup expiry (C4 close)
-bool is_setup_expired = not na(active_c2_bar) and (bar_index > active_c2_bar + 2)
+bool is_setup_expired = not na(active_c2_bar) and (bar_index > active_c2_bar + 2 or (bar_index == active_c2_bar + 2 and barstate.isconfirmed))
 
 // ==========================================
 // 6. ACTIVE SETUP LINES (C1 Swept + C2 Extreme)
@@ -319,7 +310,7 @@ if barstate.islast
             t := na
     else if show_tbl
         if na(t)
-            t := table.new(table_pos_id, 6, 10, bgcolor=color.rgb(15, 23, 42), border_color=color.rgb(51, 65, 85), border_width=1)
+            t := table.new(table_pos_id, 6, 12, bgcolor=color.rgb(15, 23, 42), border_color=color.rgb(51, 65, 85), border_width=1)
 
         float taban_full_pct    = total_n > 0 ? (total_full * 100.0 / total_n) : na
         float taban_reaches_pct = total_n > 0 ? (total_reaches * 100.0 / total_n) : na
@@ -341,7 +332,7 @@ if barstate.islast
         table.merge_cells(t, 0, 0, 5, 0)
 
         // Row 1: Active Setup Status Board (compact single line)
-        bool is_live = not na(active_c2_bar) and (bar_index - active_c2_bar <= 2)
+        bool is_live = not na(active_c2_bar) and not is_setup_expired
         string phase_txt = ""
         if is_live
             int bars_since = bar_index - active_c2_bar
@@ -356,10 +347,10 @@ if barstate.islast
                 active_banner := "INVALIDATED: " + active_dir + " (" + fail_phase + ") · C2 Extreme Broken"
                 active_bg     := color.rgb(71, 85, 105)
             else
-                active_banner := "LIVE: " + active_dir + " (" + phase_txt + ") · RS: %" + str.tostring(active_rs, "0.0") + " · Wick: %" + str.tostring(active_wick, "0.0")
+                active_banner := "LIVE: " + active_dir + " (" + phase_txt + ") · RS: " + str.tostring(active_rs, "0.0") + "% · Sweep: " + str.tostring(active_wick, "0.0") + "%"
                 active_bg     := active_dir == "Bull" ? color.rgb(6, 78, 59) : color.rgb(136, 19, 55)
         else
-            active_banner := "STANDBY" + (active_dir != "" ? " (Last: " + active_dir + " · %" + str.tostring(active_rs, "0.0") + (active_failed ? " · Invalidated)" : ")") : "")
+            active_banner := "STANDBY" + (active_dir != "" ? " (Last: " + active_dir + (active_failed ? " · Invalidated)" : " · Full C4 held)") : "")
             active_bg := color.rgb(30, 41, 59)
 
         table.cell(t, 0, 1, active_banner, bgcolor=active_bg, text_color=color.rgb(248, 250, 252), text_size=table_sz)
@@ -371,7 +362,7 @@ if barstate.islast
         table.cell(t, 2, 2, "Reach C4", bgcolor=color.rgb(30, 41, 59), text_color=color.rgb(203, 213, 225), text_size=table_sz)
         table.cell(t, 3, 2, "Full C4", bgcolor=color.rgb(30, 41, 59), text_color=color.rgb(203, 213, 225), text_size=table_sz)
         table.cell(t, 4, 2, "XC2", bgcolor=color.rgb(30, 41, 59), text_color=color.rgb(203, 213, 225), text_size=table_sz)
-        table.cell(t, 5, 2, "Base Δ", bgcolor=color.rgb(30, 41, 59), text_color=color.rgb(203, 213, 225), text_size=table_sz)
+        table.cell(t, 5, 2, "Reach Δ", bgcolor=color.rgb(30, 41, 59), text_color=color.rgb(203, 213, 225), text_size=table_sz, tooltip="Bucket Reach C4 minus BASE Reach C4, in percentage points (pp).")
 
         // Rows 3..8: 6 RS bins
         for b = 0 to 5
@@ -411,6 +402,16 @@ if barstate.islast
         table.cell(t, 3, 9, format_pct(taban_full_pct), bgcolor=color.rgb(24, 29, 43), text_color=color.rgb(248, 250, 252), text_size=table_sz)
         table.cell(t, 4, 9, format_pct(taban_xc2_pct), bgcolor=color.rgb(24, 29, 43), text_color=color.rgb(248, 250, 252), text_size=table_sz)
         table.cell(t, 5, 9, "Ref", bgcolor=color.rgb(24, 29, 43), text_color=color.rgb(148, 163, 184), text_size=table_sz)
+
+        table.cell(t, 0, 10, previous_setup == "" ? "Latest setup shown · All completed setups counted" : previous_setup,
+             bgcolor=color.rgb(24, 29, 43), text_color=color.rgb(203, 213, 225), text_size=table_sz,
+             tooltip="Only the latest C2 is drawn. Previous records its state when replaced; an unfinished setup is still measured independently at its C4 close.")
+        table.merge_cells(t, 0, 10, 5, 10)
+        string sample_txt = is_windowed ? "Last " + str.tostring(max_lookback) + " closed bars" : "All loaded closed bars"
+        table.cell(t, 0, 11, "Chart sample · " + sample_txt,
+             bgcolor=color.rgb(24, 29, 43), text_color=color.rgb(148, 163, 184), text_size=table_sz,
+             tooltip="This feed and chart timeframe. No offline minute-completeness filter. Rates measure extreme survival, not trade profitability. Small N is less informative.")
+        table.merge_cells(t, 0, 11, 5, 11)
     else
         if not na(t)
             table.delete(t)
