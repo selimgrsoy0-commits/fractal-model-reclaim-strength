@@ -16,7 +16,7 @@ show_line_labels = input.bool(true, "Price Labels", group=grp_visual, tooltip="S
 // --- 2. STATS TABLE ---
 show_tbl    = input.bool(true, "Show Table", inline="tbl_view", group=grp_table, tooltip="Shows live setup status and historical hit rates.")
 tbl_pos     = input.string("Top Right", "Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], inline="tbl_view", group=grp_table)
-tbl_size_in = input.string("Small", "Size", options=["Small", "Tiny", "Normal"], inline="tbl_view", group=grp_table)
+tbl_size_in = input.string("Compact", "Size", options=["Compact", "Tiny", "Normal"], inline="tbl_view", group=grp_table)
 bars_mode   = input.string("All Available Bars", "Sample", options=["All Available Bars", "Last 5000 Bars", "Last 1000 Bars", "Last 500 Bars"], group=grp_table, tooltip="How many past bars feed the table statistics. Windowed modes re-filter on every bar close, so old setups drop out as new ones arrive.")
 
 // ==========================================
@@ -306,8 +306,8 @@ var string table_pos_id = switch tbl_pos
     => position.top_right
 
 var string table_sz = switch tbl_size_in
-    "Normal" => size.normal
-    "Small"  => size.small
+    "Normal"  => size.normal
+    "Compact" => size.small
     => size.tiny
 
 var table t = na
