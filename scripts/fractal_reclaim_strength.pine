@@ -1,5 +1,5 @@
 //@version=6
-indicator("Fractal Model - Reclaim Strength (RS) Engine", "FM·RS", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+indicator("Fractal Reclaim Strength", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
 
 // ==========================================
 // 1. INPUTS & SETTINGS (LEAN & MINIMAL)
@@ -327,7 +327,7 @@ if barstate.islast
             timeframe.ismonthly       => "Monthly"
             => timeframe.period
 
-        string header_txt = "FM · RS ENGINE (" + syminfo.ticker + " · " + tf_str + ")"
+        string header_txt = "Fractal Reclaim Strength (" + syminfo.ticker + " · " + tf_str + ")"
         table.cell(t, 0, 0, header_txt, bgcolor=color.rgb(24, 29, 43), text_color=color.rgb(248, 250, 252), text_size=table_sz)
         table.merge_cells(t, 0, 0, 5, 0)
 

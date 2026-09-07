@@ -13,8 +13,10 @@ import sys
 
 def build():
     source = (Path(__file__).parent / 'fractal_reclaim_strength.pine').read_text(encoding='utf-8')
-    source = source.replace('Fractal Model - Reclaim Strength (RS) Engine', 'FM RS Regression')
-    source = source.replace('"FM·RS"', '"FM·TEST"')
+    declaration = 'indicator("Fractal Reclaim Strength",'
+    if source.count(declaration) != 1:
+        raise ValueError('Production indicator declaration changed; update the fixture generator')
+    source = source.replace(declaration, 'indicator("Fractal Reclaim Regression",', 1)
     # Replace price series only; assertions below use the production variables.
     source = re.sub(r'\b(high|low|close)\b', lambda m: 'fixture_' + m[0], source)
     bars = [(10., 10., 10.)] * 32
